@@ -59,6 +59,12 @@ The `JM` package requires two datasets:
   including survival information on each row
 - a **one-row-per-patient** dataset for the survival submodel
 
+
+```{r load-data}
+patients <- readRDS("C:/Projects_Data/pharmacometrie_projet/patients_final.rds")
+longitudinal_data <- readRDS("C:/Projects_Data/pharmacometrie_projet/longitudinal_data_final.rds")
+```
+
 ```{r prepare-data}
 joint_data <- longitudinal_data %>%
   filter(SLD_obs > 0) %>%
