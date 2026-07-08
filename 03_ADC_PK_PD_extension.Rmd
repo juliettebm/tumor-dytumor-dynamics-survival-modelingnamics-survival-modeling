@@ -1,0 +1,322 @@
+---
+title: "ADC Exposure-Response Modeling: Linking Pharmacokinetics to Tumor Growth Inhibition and Survival"
+subtitle: "An oncology drug-disease modeling extension using simulated antibody-drug conjugate therapy"
+author: "Juliette Bouli-Mengue"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+```
+
+## 1. Motivation
+
+In oncology drug development, tumor dynamics models are often combined with
+pharmacokinetic/pharmacodynamic (PK/PD) models to characterize how drug exposure
+translates into tumor response and survival outcomes. This notebook extends the tumor
+dynamics framework from notebooks 1-2 by introducing an explicit ADC (antibody-drug
+conjugate) exposure-response relationship:
+
+**ADC administration → PK model (concentration over time) → PD model (drug effect) →
+Tumor Growth Inhibition model → Survival model (OS)**
+
+*Note on units: growth and PK/PD parameters in this notebook are all expressed on a
+per-day time scale, consistent with the day-level dosing schedules typical of ADC
+regimens. Where a parameter is reused from notebooks 1-2 (defined on a per-week scale
+there), it is explicitly converted to per-day here — see Section 3.*
+
+```{r libraries}
+library(dplyr)
+library(ggplot2)
+library(survival)
+library(survminer)
+
+set.seed(42)
+```
+
+## 2. Loading the simulated population
+
+We reuse the simulated oncology population generated in notebook 1: each patient has
+individual tumor growth parameters (`g`, `d`) and baseline tumor size (`SLD0`).
+Baseline disease-only survival parameters (`os_time`, `os_event`) from the earlier
+drug-agnostic hazard model are retained for reference, but survival under treatment is
+regenerated in Section 9 through the tumor-response hazard model, not reused as-is.
+
+```{r load-data}
+# Assumes patients_final.rds is saved in the same folder as this notebook
+# (produced by notebook 1) — a relative path, so the project stays portable
+# across machines. Note: longitudinal_data_final.rds is not loaded here, since
+# this notebook works from the mechanistic TGI trajectories simulated in
+# Section 7, not from the raw longitudinal scan data used in notebooks 1-2.
+patients <- readRDS("patients_final.rds")
+```
+
+## 3. Fixing the time-scale/unit mismatch
+
+`g` was defined in notebook 1 as a **per-week** regression rate. This notebook works on
+a **per-day** time grid (ADC dosing and PK elimination are naturally described in days).
+Reusing `g` directly in a per-day growth equation would silently inflate tumor growth by
+a factor of 7. We convert it explicitly once, here:
+
+```{r fix-units}
+patients <- patients %>%
+  mutate(g_daily = g / 7)
+
+summary(patients$g_daily)
+```
+
+All growth terms in this notebook use `g_daily`, never the original weekly `g`.
+
+## 4. ADC pharmacokinetic model (single representative patient)
+
+A one-compartment PK model describes ADC plasma concentration over time:
+
+$$C(t) = \frac{Dose}{V} \, e^{-k_{el} t}$$
+
+- `Dose`: administered ADC dose
+- `V`: volume of distribution
+- `k_el`: elimination rate constant
+
+```{r adc-pk-model}
+dose <- 5     # mg/kg
+V    <- 3     # L/kg
+kel  <- 0.05  # day^-1
+
+time_grid <- seq(0, 60, by = 1)  # days
+
+adc_pk <- data.frame(
+  time = time_grid,
+  concentration = (dose / V) * exp(-kel * time_grid)
+)
+
+ggplot(adc_pk, aes(x = time, y = concentration)) +
+  geom_line(linewidth = 1) +
+  labs(title = "ADC plasma concentration profile", x = "Time (days)", y = "ADC concentration") +
+  theme_minimal()
+```
+
+## 5. ADC pharmacodynamic model (Emax)
+
+$$Effect(t) = \frac{E_{max} \times C(t)}{EC_{50} + C(t)}$$
+
+```{r emax-model}
+Emax <- 0.05
+EC50 <- 1
+
+adc_pk <- adc_pk %>%
+  mutate(inhibition = Emax * concentration / (EC50 + concentration))
+
+ggplot(adc_pk, aes(x = time, y = inhibition)) +
+  geom_line(linewidth = 1) +
+  labs(title = "ADC pharmacodynamic effect", x = "Time (days)", y = "Tumor growth inhibition effect") +
+  theme_minimal()
+```
+
+## 6. Tumor Growth Inhibition (single representative patient)
+
+$$\frac{dSLD}{dt} = g_{daily} \times SLD - Effect(t) \times SLD$$
+
+The first term is intrinsic exponential growth; the second is drug-induced shrinkage.
+*Plasma ADC exposure is used here as a surrogate driver of pharmacodynamic activity in
+this simplified model — a real ADC acts through tumor distribution, internalization,
+and payload release, steps not represented individually here.* As ADC concentration
+declines, its effect fades and intrinsic growth eventually dominates again (single-dose
+scenario, no re-dosing).
+
+```{r tgi-single-patient}
+g_daily_example <- 0.025 / 7
+SLD0_example <- 60
+
+tgi_data <- adc_pk
+tgi_data$SLD <- NA
+tgi_data$SLD[1] <- SLD0_example
+
+for (i in 2:nrow(tgi_data)) {
+  dt <- tgi_data$time[i] - tgi_data$time[i - 1]
+  growth <- g_daily_example * tgi_data$SLD[i - 1]
+  drug_effect <- tgi_data$inhibition[i - 1] * tgi_data$SLD[i - 1]
+  tgi_data$SLD[i] <- tgi_data$SLD[i - 1] + (growth - drug_effect) * dt
+}
+
+ggplot(tgi_data, aes(x = time, y = SLD)) +
+  geom_line(color = "steelblue", linewidth = 1.2) +
+  labs(title = "Tumor Growth Inhibition for a Representative Patient",
+       x = "Time (days)", y = "Tumor size (SLD)") +
+  theme_minimal()
+```
+
+## 7. Population simulation with individual PK variability
+
+Each patient is given their own elimination rate `kel_i` (log-normal, reflecting
+realistic inter-patient PK variability), and their own `g_daily` from Section 3. *For
+simplicity, inter-individual PK variability is introduced directly on `kel` rather than
+separately on clearance (CL) and volume of distribution (V), as would be done in a full
+population-PK model (`kel = CL/V`, with variability structured on `CL`).* For
+each patient we simulate **two** trajectories over the same 60-day window:
+
+- `SLD` under ADC treatment (with the inhibition term)
+- `SLD_no_drug`, the counterfactual trajectory with no drug effect (inhibition = 0)
+
+The counterfactual is needed later for a fair "ADC vs. No ADC" survival comparison
+(Section 9) — both arms must be evaluated under the same hazard model, differing only in
+the tumor trajectory that feeds into it.
+
+```{r individual-pk-population}
+patients <- patients %>%
+  mutate(kel_i = rlnorm(n(), meanlog = log(0.05), sdlog = 0.20))
+
+population_tgi <- data.frame()
+
+for (i in 1:nrow(patients)) {
+  g_i    <- patients$g_daily[i]
+  kel_i  <- patients$kel_i[i]
+  SLD0_i <- patients$SLD0[i]
+
+  conc      <- (dose / V) * exp(-kel_i * time_grid)
+  inhibition <- Emax * conc / (EC50 + conc)
+
+  SLD          <- numeric(length(time_grid)); SLD[1] <- SLD0_i
+  SLD_no_drug  <- numeric(length(time_grid)); SLD_no_drug[1] <- SLD0_i
+
+  for (t in 2:length(time_grid)) {
+    SLD[t]         <- SLD[t - 1] + (g_i * SLD[t - 1] - inhibition[t - 1] * SLD[t - 1])
+    SLD_no_drug[t] <- SLD_no_drug[t - 1] + (g_i * SLD_no_drug[t - 1])  # pure growth, no drug
+  }
+
+  population_tgi <- bind_rows(
+    population_tgi,
+    data.frame(patient_id = patients$patient_id[i], time = time_grid,
+               SLD = SLD, SLD_no_drug = SLD_no_drug)
+  )
+}
+
+head(population_tgi)
+
+ggplot(population_tgi, aes(time, SLD, group = patient_id)) +
+  geom_line(alpha = 0.15) +
+  labs(title = "Tumor trajectories under ADC treatment", x = "Time (days)", y = "Tumor size (SLD)") +
+  theme_minimal()
+
+# Direct visual comparison for a subset of patients: treated vs. untreated counterfactual
+population_tgi %>%
+  filter(patient_id <= 20) %>%
+  ggplot(aes(x = time)) +
+  geom_line(aes(y = SLD, group = patient_id), alpha = 0.3) +
+  geom_line(aes(y = SLD_no_drug, group = patient_id), alpha = 0.3, linetype = "dashed") +
+  labs(title = "Tumor trajectories: ADC treatment (solid) vs. no-treatment counterfactual (dashed)",
+       x = "Time (days)", y = "Tumor size (SLD)") +
+  theme_minimal()
+```
+
+## 8. Exposure-response analysis
+
+Individual ADC exposure is summarized using the analytical AUC formula for a
+one-compartment IV bolus model with first-order elimination
+(AUC = Dose / (V × k_el)). Response is tumor size at day 60 (`SLD60`).
+
+```{r exposure-response}
+patients <- patients %>%
+  mutate(AUC = dose / (V * kel_i))
+
+day60 <- population_tgi %>%
+  filter(time == 60) %>%
+  dplyr::select(patient_id, SLD60 = SLD, SLD60_no_drug = SLD_no_drug)
+
+exposure_response <- patients %>%
+  dplyr::select(patient_id, AUC, os_time, os_event) %>%
+  left_join(day60, by = "patient_id")
+
+summary(exposure_response$AUC)
+summary(exposure_response$SLD60)
+
+exposure_model <- lm(SLD60 ~ AUC, data = exposure_response)
+summary(exposure_model)
+
+ggplot(exposure_response, aes(x = AUC, y = SLD60)) +
+  geom_point() +
+  geom_smooth(method = "lm", se = TRUE) +
+  theme_bw() +
+  labs(x = "ADC exposure (AUC, mg/L\u00b7day)", y = "Tumor size at day 60 (SLD)")
+```
+
+**Interpretation.** A negative slope would indicate that higher ADC exposure is
+associated with stronger tumor inhibition at day 60 — the expected exposure-response
+relationship for an effective ADC.
+
+## 9. Linking tumor response to survival: a landmark analysis
+
+To connect tumor response to survival, we use `SLD60` — tumor burden at a fixed
+"landmark" time of day 60 — as a baseline predictor of subsequent survival. This is a
+standard, simple approach in oncology (landmark analysis), chosen here for
+interpretability; its main limitation is discussed in Section 10.
+
+Both arms (ADC and its no-drug counterfactual) are evaluated under the **same** hazard
+structure, differing only in the tumor burden that feeds into it — this is what makes
+the comparison a fair counterfactual, unlike using two unrelated hazard formulas. In
+this simplified framework, `SLD60` is treated as a **prognostic biomarker** — a proxy for
+overall disease status — rather than a direct mechanistic driver of death; the hazard
+model below is a statistical association, not a claim about biological causality.
+
+**Important:** the survival times computed below (`os_time`) represent *post-landmark*
+survival, measured from day 60 onward — not total overall survival from treatment
+initiation. The reported medians (e.g., "ADC: 536 days") should be read as "536 days
+after the day-60 landmark", not as total OS from day 0.
+
+$$h_i = h_0 \times e^{\beta \times (SLD60_i - \overline{SLD60})}$$
+
+```{r landmark-survival}
+baseline_hazard <- 0.002   # per day
+beta_SLD <- 0.01
+
+pooled_mean_SLD60 <- mean(c(exposure_response$SLD60, exposure_response$SLD60_no_drug))
+
+survival_comparison <- bind_rows(
+  exposure_response %>%
+    transmute(patient_id, SLD60_used = SLD60, treatment = "ADC"),
+  exposure_response %>%
+    transmute(patient_id, SLD60_used = SLD60_no_drug, treatment = "No ADC")
+) %>%
+  mutate(
+    hazard = baseline_hazard * exp(beta_SLD * (SLD60_used - pooled_mean_SLD60)),
+    event_time_from_landmark = rexp(n(), rate = hazard),
+    admin_censoring = 720,  # days of follow-up after the day-60 landmark
+    os_time  = pmin(event_time_from_landmark, admin_censoring),
+    os_event = as.integer(event_time_from_landmark <= admin_censoring)
+  )
+
+survival_comparison %>%
+  group_by(treatment) %>%
+  summarise(median_survival = median(os_time), mean_survival = mean(os_time))
+
+km_fit <- survfit(Surv(os_time, os_event) ~ treatment, data = survival_comparison)
+
+ggsurvplot(km_fit, data = survival_comparison, risk.table = TRUE, pval = TRUE,
+           xlab = "Time from landmark (days)", ylab = "Survival probability",
+           title = "Post-landmark survival comparison: ADC vs. No ADC (from day-60 landmark)")
+```
+
+## 10. Conclusion and limitations
+
+This workflow demonstrates a complete, internally consistent PK/PD/TGI/survival chain:
+ADC pharmacokinetics determine drug concentration over time, which drives
+pharmacodynamic activity, which modifies tumor growth dynamics, which in turn is linked
+to survival through a shared hazard structure.
+
+**Limitations, stated explicitly:**
+
+- The TGI model here uses a single-dose exponential-growth/Emax-inhibition ODE, not the
+  biexponential regrowth model from notebooks 1-2; it does not capture acquired
+  resistance beyond simple loss of drug effect as concentration declines, and assumes no
+  re-dosing. It also assumes an immediate relationship between ADC exposure and tumor
+  shrinkage (a direct "kill" term), rather than a delayed or indirect-response structure
+  (e.g., separate sensitive/resistant cell compartments), as used in some more mechanistic
+  oncology TGI models.
+- The landmark analysis (Section 9) avoids immortal-time bias by fixing tumor burden at
+  a single time point, but discards potential early events before day 60 and depends on
+  the choice of landmark time — a known trade-off of this method, not a flaw specific to
+  this simulation.
+- Euler integration with a 1-day step is used for simplicity; a smaller step size (or an
+  ODE solver such as `deSolve::ode()`) would be more numerically robust for stiffer
+  parameter combinations, and is the more standard implementation choice for
+  pharmacometric ODE systems in general — not required here given the model's stability
+  over this time scale, but a natural next step if the model is extended.
