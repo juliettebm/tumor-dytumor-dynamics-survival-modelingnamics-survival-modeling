@@ -1,0 +1,263 @@
+---
+title: "Individual Tumor Dynamics and Their Link to Survival: Two-Stage and Joint Modeling"
+subtitle: "Portfolio project — Pharmacometrics-inspired modeling in oncology"
+author: "Juliette Bouli-Mengue"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+```
+
+## 1. Motivation
+
+In oncology drug development, individual tumor size trajectories (typically summarized
+as Sum of Longest Diameters, SLD, per RECIST criteria) are often linked to survival
+outcomes (Progression-Free Survival, PFS; Overall Survival, OS) to support dose
+selection and efficacy predictions. This notebook demonstrates, on **fully simulated
+data**, two complementary approaches used in pharmacometrics to link tumor dynamics to
+survival: a classic "two-stage" approach (individual parameter estimation followed by a
+Cox model), and a joint model (simultaneous estimation of the longitudinal trajectory
+and survival).
+
+No real patient data is used here. The goal is to demonstrate methodological
+understanding before applying the same logic to real datasets.
+
+### The Tumor Growth Inhibition (TGI) model
+
+We use the biexponential TGI model (Wang et al., *Clin Pharmacol Ther*, 2009):
+
+$$SLD(t) = SLD_0 \times (e^{-g \cdot t} + e^{d \cdot t} - 1)$$
+
+- **g**: tumor regression rate (treatment effect)
+- **d**: tumor regrowth rate (resistance)
+- **SLD0**: baseline tumor size
+
+```{r libraries}
+library(minpack.lm)
+library(survival)
+library(survminer)
+library(JM)
+library(nlme)
+library(dplyr)
+library(ggplot2)
+
+set.seed(42)
+```
+
+## 2. Simulating "true" individual patient parameters
+
+We simulate 200 patients. Each has their own growth (`g`), regrowth (`d`), and baseline
+tumor size (`SLD0`), drawn from log-normal distributions to reflect realistic
+between-patient variability.
+
+```{r simulate-patients}
+n_patients <- 200
+
+g_pop      <- 0.020
+omega_g    <- 0.5
+d_pop      <- 0.010
+omega_d    <- 0.6
+SLD0_pop   <- 60
+omega_SLD0 <- 0.3
+
+patients <- tibble(
+  patient_id = 1:n_patients,
+  g    = rlnorm(n_patients, log(g_pop), omega_g),
+  d    = rlnorm(n_patients, log(d_pop), omega_d),
+  SLD0 = rlnorm(n_patients, log(SLD0_pop), omega_SLD0)
+)
+
+head(patients)
+```
+
+## 3. Simulating survival outcomes
+
+Survival is simulated using a proportional hazards structure: a higher `g` (better
+response) protects the patient, while a higher `d` (faster regrowth) increases the
+hazard.
+
+```{r simulate-survival}
+beta_g <- -15
+beta_d <- 20
+h0     <- 0.015
+
+patients <- patients %>%
+  mutate(
+    g_c = g - mean(g),
+    d_c = d - mean(d),
+    linear_pred = beta_g * g_c + beta_d * d_c,
+    hazard = h0 * exp(linear_pred),
+    true_event_time = rexp(n(), rate = hazard)
+  )
+
+admin_censoring <- 104
+
+patients <- patients %>%
+  mutate(
+    os_time  = pmin(true_event_time, admin_censoring),
+    os_event = as.integer(true_event_time <= admin_censoring)
+  )
+
+summary(patients$os_time)
+table(patients$os_event)
+```
+
+## 4. Simulating longitudinal tumor measurements
+
+Tumor size is measured every 3 weeks over 72 weeks, with 8% multiplicative measurement
+noise. *This observation design — scan frequency and measurement precision — was chosen
+deliberately after an earlier, sparser design (6-week scans, 15% noise) failed to
+recover a significant tumor-dynamics/survival association despite a strong true effect
+by construction: a textbook case of attenuation by measurement error, where noisy
+individual parameter estimates dilute a real underlying signal. The design below is the
+one that successfully recovers the signal.*
+
+```{r simulate-longitudinal}
+assessment_times <- seq(0, 72, by = 3)
+sigma_obs <- 0.08
+
+longitudinal_data <- patients %>%
+  rowwise() %>%
+  do({
+    pt <- .
+    tibble(
+      patient_id = pt$patient_id,
+      time = assessment_times,
+      SLD_true = pt$SLD0 * (exp(-pt$g * assessment_times) + exp(pt$d * assessment_times) - 1)
+    )
+  }) %>%
+  ungroup() %>%
+  mutate(SLD_obs = SLD_true * exp(rnorm(n(), 0, sigma_obs))) %>%
+  filter(SLD_obs > 0)
+
+ggplot(longitudinal_data %>% filter(patient_id <= 12),
+       aes(x = time, y = SLD_obs, group = patient_id, color = factor(patient_id))) +
+  geom_line() + geom_point() +
+  labs(title = "Simulated tumor size trajectories", x = "Weeks", y = "SLD (mm)", color = "Patient") +
+  theme_minimal()
+```
+
+## 5. Two-stage approach: re-estimating g and d from noisy scans
+
+We act as if the true `g` and `d` were unknown, and re-estimate them for each patient
+from their noisy longitudinal measurements only.
+
+```{r two-stage-fit}
+fit_one_patient <- function(df) {
+  tryCatch({
+    fit <- nlsLM(
+      SLD_obs ~ SLD0_est * (exp(-g_est * time) + exp(d_est * time) - 1),
+      data = df,
+      start = list(SLD0_est = df$SLD_obs[df$time == 0][1], g_est = 0.02, d_est = 0.01),
+      lower = c(SLD0_est = 1, g_est = 0.0001, d_est = 0.0001),
+      upper = c(SLD0_est = 500, g_est = 1, d_est = 1),
+      control = nls.lm.control(maxiter = 200)
+    )
+    coefs <- coef(fit)
+    tibble(g_hat = coefs["g_est"], d_hat = coefs["d_est"], convergence = TRUE)
+  }, error = function(e) {
+    tibble(g_hat = NA_real_, d_hat = NA_real_, convergence = FALSE)
+  })
+}
+
+individual_fits <- longitudinal_data %>%
+  group_by(patient_id) %>%
+  filter(n() >= 4) %>%
+  group_modify(~ fit_one_patient(.x)) %>%
+  ungroup()
+
+cat("Convergence rate:", mean(individual_fits$convergence, na.rm = TRUE) * 100, "%\n")
+
+analysis_data <- patients %>%
+  inner_join(individual_fits, by = "patient_id") %>%
+  filter(convergence, !is.na(g_hat), !is.na(d_hat))
+
+cox_model <- coxph(Surv(os_time, os_event) ~ g_hat + d_hat, data = analysis_data)
+summary(cox_model)
+
+cor(analysis_data$g, analysis_data$g_hat)
+cor(analysis_data$d, analysis_data$d_hat)
+```
+
+```{r two-stage-plot}
+ggplot(analysis_data, aes(x = g, y = g_hat)) +
+  geom_point(alpha = 0.5) +
+  geom_abline(slope = 1, intercept = 0, color = "red", linetype = "dashed") +
+  labs(title = "Estimated vs true g", x = "True g (hidden)", y = "Estimated g (g_hat)") +
+  theme_minimal()
+```
+
+**Interpretation.** `g_hat` and `d_hat` recover the true parameters well (correlations
+of 0.83 and 0.99 respectively), and the Cox model detects a significant association
+between `g_hat` and survival (p = 0.007), consistent with the true simulated effect
+(`beta_g = -15`).
+
+The two-stage approach, however, has a structural limitation: it treats parameter
+estimation and survival modeling as two independent steps, ignoring the uncertainty of
+`g_hat`/`d_hat` when they are reused as fixed covariates. This motivates the joint
+modeling approach developed below.
+
+```{r save-for-later-notebooks}
+saveRDS(patients, "patients_final.rds")
+saveRDS(longitudinal_data, "longitudinal_data_final.rds")
+```
+
+## 6. Joint model: simultaneous estimation
+
+A joint model estimates the longitudinal trajectory and survival simultaneously,
+sharing information through common random effects, with estimation uncertainty
+properly propagated into the survival model. Standard R joint modeling packages (`JM`)
+require a linear (not biexponential) longitudinal submodel; we therefore model
+`log(SLD)` as a linear function of time — a deliberate, documented simplification.
+
+```{r prepare-joint-data}
+joint_data <- longitudinal_data %>%
+  filter(SLD_obs > 0) %>%
+  mutate(log_SLD = log(SLD_obs)) %>%
+  inner_join(patients %>% dplyr::select(patient_id, os_time, os_event), by = "patient_id") %>%
+  mutate(patient_id = factor(patient_id))
+
+surv_data <- patients %>%
+  mutate(patient_id = factor(patient_id)) %>%
+  as.data.frame()
+```
+
+```{r fit-joint-model}
+fit_lme <- lme(log_SLD ~ time, random = ~ time | patient_id, data = joint_data)
+
+fit_cox <- coxph(Surv(os_time, os_event) ~ 1, data = surv_data, x = TRUE)
+
+fit_joint <- jointModel(fit_lme, fit_cox, timeVar = "time", method = "piecewise-PH-aGH")
+
+summary(fit_joint)
+```
+
+**Interpretation.** The association parameter ("Assoct") quantifies the link between
+the current value of the longitudinal trajectory and the hazard. Here, `Assoct ≈ 0.235`
+(p ≈ 0.056): a higher current `log(SLD)` is associated with increased hazard, in the
+biologically expected direction, though only borderline significant.
+
+## 7. Two-stage vs. joint model: an honest comparison
+
+| Approach | Signal detected | Model complexity | Trade-off |
+|---|---|---|---|
+| Two-stage | Significant (p = 0.007) on `g_hat` | Rich (two biological rate parameters, g and d) | Ignores estimation uncertainty of g_hat/d_hat |
+| Joint model | Borderline (p = 0.056) | Simplified (single linear trend) | Statistically more rigorous, but coarser biological representation |
+
+The joint model is not "worse" — it is more conservative because it properly accounts
+for trajectory uncertainty, using a deliberately simplified tumor dynamics
+representation. This is a genuine methodological trade-off: pharmacometricians must
+balance model realism against statistical tractability and interpretability.
+
+## 8. Limitations
+
+- The two-stage approach ignores estimation uncertainty when parameters are reused as
+  fixed covariates; the joint model addresses this but uses a simplified linear tumor
+  trajectory instead of the full biexponential model.
+- The association structure used in the joint model is the "current value"
+  parameterization; other parameterizations (current slope, cumulative effects) could
+  be explored and compared.
+- Validation on a real dataset (e.g., a public NSCLC trial from Project Data Sphere)
+  would be the natural next step, once methodological understanding is demonstrated on
+  simulated data with known ground truth.

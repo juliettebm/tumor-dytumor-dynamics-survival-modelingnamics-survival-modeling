@@ -364,15 +364,15 @@ simulated antibody-drug conjugate therapy</h3>
 combined with pharmacokinetic/pharmacodynamic (PK/PD) models to
 characterize how drug exposure translates into tumor response and
 survival outcomes. This notebook extends the tumor dynamics framework
-from notebooks 1-2 by introducing an explicit ADC (antibody-drug
-conjugate) exposure-response relationship:</p>
+from notebook 1 by introducing an explicit ADC (antibody-drug conjugate)
+exposure-response relationship:</p>
 <p><strong>ADC administration → PK model (concentration over time) → PD
 model (drug effect) → Tumor Growth Inhibition model → Survival model
 (OS)</strong></p>
 <p><em>Note on units: growth and PK/PD parameters in this notebook are
 all expressed on a per-day time scale, consistent with the day-level
 dosing schedules typical of ADC regimens. Where a parameter is reused
-from notebooks 1-2 (defined on a per-week scale there), it is explicitly
+from notebook 1 (defined on a per-week scale there), it is explicitly
 converted to per-day here — see Section 3.</em></p>
 <pre class="r"><code>library(dplyr)
 library(ggplot2)
@@ -391,10 +391,10 @@ disease-only survival parameters (<code>os_time</code>,
 retained for reference, but survival under treatment is regenerated in
 Section 9 through the tumor-response hazard model, not reused as-is.</p>
 <pre class="r"><code># Assumes patients_final.rds is saved in the same folder as this notebook
-# (produced by notebook 1) — a relative path, so the project stays portable
+# (produced by notebook 1), a relative path, so the project stays portable
 # across machines. Note: longitudinal_data_final.rds is not loaded here, since
 # this notebook works from the mechanistic TGI trajectories simulated in
-# Section 7, not from the raw longitudinal scan data used in notebooks 1-2.
+# Section 7, not from the raw longitudinal scan data used in notebook 1.
 patients &lt;- readRDS(&quot;patients_final.rds&quot;)</code></pre>
 </div>
 <div id="fixing-the-time-scaleunit-mismatch" class="section level2">
@@ -684,9 +684,11 @@ through a shared hazard structure.</p>
 <ul>
 <li>The TGI model here uses a single-dose
 exponential-growth/Emax-inhibition ODE, not the biexponential regrowth
-model from notebooks 1-2; it does not capture acquired resistance beyond
+model from notebook 1; it does not capture acquired resistance beyond
 simple loss of drug effect as concentration declines, and assumes no
-re-dosing. It also assumes an immediate relationship between ADC
+re-dosing. See notebook 4 for an extension incorporating repeated dosing
+via the superposition principle, applied to a multi-lesion RECIST
+framework. It also assumes an immediate relationship between ADC
 exposure and tumor shrinkage (a direct “kill” term), rather than a
 delayed or indirect-response structure (e.g., separate
 sensitive/resistant cell compartments), as used in some more mechanistic
